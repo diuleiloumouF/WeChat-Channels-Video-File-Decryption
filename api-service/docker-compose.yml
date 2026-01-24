@@ -16,6 +16,7 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
+      - POOL_SIZE=3
 
     restart: unless-stopped
 
