@@ -83,8 +83,14 @@ class PagePool {
      * 创建单个页面
      */
     async _createPage(index) {
-        const pg = await this.browser.newPage();
+        const context = await this.browser.newContext({
+            // 增加内存限制以支持大文件处理
+            javaScriptEnabled: true,
+        });
+
+        const pg = await context.newPage();
         pg._poolIndex = index;
+        pg._context = context;
 
         await pg.goto(getWorkerUrl());
 
@@ -100,7 +106,7 @@ class PagePool {
     /**
      * 获取一个可用页面（如果没有则等待）
      */
-    async acquire(timeout = 300000) {
+    async acquire(timeout = 600000) {
         // 如果有可用页面，直接返回
         if (this.available.length > 0) {
             const pg = this.available.shift();
@@ -198,6 +204,10 @@ class PagePool {
             try {
                 if (pg && !pg.isClosed()) {
                     await pg.close();
+                    // 关闭context
+                    if (pg._context) {
+                        await pg._context.close();
+                    }
                 }
             } catch (e) {
                 // 忽略关闭错误
@@ -361,7 +371,15 @@ async function initBrowser() {
 
     browser = await chromium.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--js-flags=--max-old-space-size=4096',  // 增加V8内存限制到4GB
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process'
+        ]
     });
 
     page = await browser.newPage();
@@ -548,36 +566,37 @@ app.post('/api/decrypt', upload.single('video'), async (req, res) => {
         console.log(`   decode_key: ${decode_key}`);
         console.log(`   文件: ${videoFile.originalname} (${(videoFile.size / 1024 / 1024).toFixed(2)} MB)`);
 
-        // 根据文件大小动态设置超时时间（基础30秒 + 每MB额外1秒）
-        const fileSizeMB = videoFile.size / 1024 / 1024;
-        const timeout = Math.max(60000, 30000 + fileSizeMB * 1000);
-
         // 使用锁机制确保串行处理
         const result = await withPageLock(async () => {
             const startTime = Date.now();
 
             // 步骤 1: 生成密钥流
-            console.log('   [1/3] 生成密钥流...');
-            const keystreamBase64 = await evaluateWithTimeout(
-                async (key) => await window.generateKeystream(key),
+            console.log('   [1/2] 生成密钥流...');
+            const keystreamHex = await evaluateWithTimeout(
+                async (key) => await window.generateKeystreamHex(key),
                 decode_key,
                 30000
             );
 
-            // 步骤 2: 转换视频为 Base64
-            console.log('   [2/3] 编码视频数据...');
-            const encryptedBase64 = videoFile.buffer.toString('base64');
+            // 步骤 2: 在 Node.js 端执行 XOR 解密（避免传输大文件到浏览器）
+            console.log('   [2/2] 执行 XOR 解密 (Node.js)...');
+            const keystream = Buffer.from(keystreamHex, 'hex');
+            const encrypted = videoFile.buffer;
+            const decrypted = Buffer.alloc(encrypted.length);
 
-            // 步骤 3: 在浏览器中执行解密（大文件需要更长超时）
-            console.log('   [3/3] 执行 XOR 解密...');
-            const decryptedBase64 = await evaluateWithTimeout(
-                (params) => window.decryptVideo(params.encrypted, params.keystream),
-                { encrypted: encryptedBase64, keystream: keystreamBase64 },
-                timeout
-            );
+            // 微信只加密前128KB，所以只解密前128KB
+            const KEYSTREAM_SIZE = 131072;
+            const decryptLen = Math.min(KEYSTREAM_SIZE, encrypted.length);
 
-            // Base64 → Buffer
-            const decrypted = Buffer.from(decryptedBase64, 'base64');
+            // XOR 解密前128KB
+            for (let i = 0; i < decryptLen; i++) {
+                decrypted[i] = encrypted[i] ^ keystream[i];
+            }
+
+            // 复制剩余未加密部分
+            for (let i = decryptLen; i < encrypted.length; i++) {
+                decrypted[i] = encrypted[i];
+            }
 
             // 验证 MP4 签名
             const ftyp = decrypted.toString('utf8', 4, 8);
@@ -633,38 +652,38 @@ app.post('/api/decrypt-concurrent', upload.single('video'), async (req, res) => 
         console.log(`   文件: ${videoFile.originalname} (${(videoFile.size / 1024 / 1024).toFixed(2)} MB)`);
         console.log(`   页面池状态: ${JSON.stringify(pagePool.getStatus())}`);
 
-        // 根据文件大小动态设置超时时间
-        const fileSizeMB = videoFile.size / 1024 / 1024;
-        const timeout = Math.max(60000, 30000 + fileSizeMB * 1000);
-
         // 使用页面池执行（支持并发）
         const result = await withPoolPage(async (pg) => {
             const startTime = Date.now();
 
             // 步骤 1: 生成密钥流
-            console.log(`   [页面#${pg._poolIndex}] [1/3] 生成密钥流...`);
-            const keystreamBase64 = await evaluateWithTimeoutOnPage(
+            console.log(`   [页面#${pg._poolIndex}] [1/2] 生成密钥流...`);
+            const keystreamHex = await evaluateWithTimeoutOnPage(
                 pg,
-                async (key) => await window.generateKeystream(key),
+                async (key) => await window.generateKeystreamHex(key),
                 decode_key,
                 30000
             );
 
-            // 步骤 2: 转换视频为 Base64
-            console.log(`   [页面#${pg._poolIndex}] [2/3] 编码视频数据...`);
-            const encryptedBase64 = videoFile.buffer.toString('base64');
+            // 步骤 2: 在 Node.js 端执行 XOR 解密（避免传输大文件到浏览器）
+            console.log(`   [页面#${pg._poolIndex}] [2/2] 执行 XOR 解密 (Node.js)...`);
+            const keystream = Buffer.from(keystreamHex, 'hex');
+            const encrypted = videoFile.buffer;
+            const decrypted = Buffer.alloc(encrypted.length);
 
-            // 步骤 3: 在浏览器中执行解密
-            console.log(`   [页面#${pg._poolIndex}] [3/3] 执行 XOR 解密...`);
-            const decryptedBase64 = await evaluateWithTimeoutOnPage(
-                pg,
-                (params) => window.decryptVideo(params.encrypted, params.keystream),
-                { encrypted: encryptedBase64, keystream: keystreamBase64 },
-                timeout
-            );
+            // 微信只加密前128KB，所以只解密前128KB
+            const KEYSTREAM_SIZE = 131072;
+            const decryptLen = Math.min(KEYSTREAM_SIZE, encrypted.length);
 
-            // Base64 → Buffer
-            const decrypted = Buffer.from(decryptedBase64, 'base64');
+            // XOR 解密前128KB
+            for (let i = 0; i < decryptLen; i++) {
+                decrypted[i] = encrypted[i] ^ keystream[i];
+            }
+
+            // 复制剩余未加密部分
+            for (let i = decryptLen; i < encrypted.length; i++) {
+                decrypted[i] = encrypted[i];
+            }
 
             // 验证 MP4 签名
             const ftyp = decrypted.toString('utf8', 4, 8);

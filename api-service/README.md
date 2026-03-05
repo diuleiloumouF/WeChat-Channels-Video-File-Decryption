@@ -9,11 +9,12 @@
 ### 核心特性
 
 - **完美兼容**: 在真实 Chromium 浏览器中执行微信官方 WASM v1.2.46
-- **RPC 架构**: Node.js 通过 Playwright 调用浏览器环境中的解密函数
+- **混合架构**: 密钥流生成在浏览器(WASM)，XOR解密在Node.js(高性能)
+- **并发支持**: 页面池机制支持多请求并发处理
 - **RESTful API**: 标准的 HTTP 接口，易于集成
 - **Docker 支持**: 开箱即用的容器化部署
 - **健康检查**: 内置服务健康监控
-- **大文件支持**: 最大支持 500MB 视频文件
+- **大文件支持**: 无文件大小限制，已测试支持200MB+视频
 
 ## 架构说明
 
@@ -519,13 +520,50 @@ docker-compose build --no-cache
 limits: { fileSize: 500 * 1024 * 1024 } // 500MB
 ```
 
+### 问题: 大文件（>60MB）解密失败
+
+**症状**:
+```
+❌ [并发] 解密失败: page.evaluate: Target page, context or browser has been closed
+⚠️ 页面 #0 执行出错，将重建
+```
+
+**原因**: Docker容器内存不足，浏览器页面因内存压力崩溃
+
+**解决方案**:
+
+1. **增加Docker内存限制** (docker-compose.yml):
+```yaml
+deploy:
+  resources:
+    limits:
+      memory: 6G  # 从2G增加到6G
+```
+
+2. **重启容器**:
+```bash
+docker-compose down
+docker-compose up -d
+```
+
+3. **验证内存配置**:
+```bash
+docker stats wechat-decrypt-api
+```
+
+**已优化配置**:
+- Chromium启动参数：`--js-flags=--max-old-space-size=4096` (4GB V8内存)
+- 动态超时：基础60秒 + 每MB额外2秒
+- 页面池获取超时：10分钟
+- 共享内存：2GB (`shm_size`)
+
 ## 性能优化建议
 
 ### 1. 复用浏览器实例
 
 当前实现已自动复用浏览器实例，避免每次请求都启动新浏览器。
 
-### 2. 调整资源限制
+### 2. 调整资源限制（重要：处理大文件必须配置）
 
 根据服务器配置调整 docker-compose.yml 中的资源限制:
 
@@ -534,8 +572,17 @@ deploy:
   resources:
     limits:
       cpus: '4'      # 增加 CPU 限制
-      memory: 4G     # 增加内存限制
+      memory: 6G     # 增加内存限制（处理大文件需要至少6GB）
+    reservations:
+      memory: 1G     # 最小内存保留
 ```
+
+**重要提示**：处理大于60MB的视频文件时，需要增加Docker容器内存限制：
+- 60MB以下文件：2GB内存足够
+- 60-150MB文件：建议4GB内存
+- 150MB以上文件：建议6GB或更多内存
+
+内存计算公式：`所需内存 ≈ 文件大小 × 4 + 2GB（基础开销）`
 
 ### 3. 启用请求缓存
 
